@@ -1,0 +1,586 @@
+package com.intercom.windfilter
+
+import android.Manifest
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
+import android.media.AudioFormat
+import android.media.AudioManager
+import android.media.AudioRecord
+import android.media.AudioTrack
+import android.media.MediaRecorder
+import android.os.Build
+import android.os.Bundle
+import android.os.IBinder
+import android.os.PowerManager
+import android.util.Log
+import android.widget.Button
+import android.widget.TextView
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
+import kotlinx.coroutines.*
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.tan
+
+/*
+ =========================================================================================
+ BÖLÜM 1: AndroidManifest.xml Tanımları (Projenize bu etiketleri ekleyin)
+ =========================================================================================
+
+ <?xml version="1.0" encoding="utf-8"?>
+ <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+     package="com.intercom.windfilter">
+
+     <!-- Ses Kaydı ve Güç Yönetimi İzinleri -->
+     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+     <uses-permission android:name="android.permission.WAKE_LOCK" />
+     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+     <!-- Android 9.0+ Foreground Servis İzinleri -->
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+     <!-- Android 14+ (API 34+) Mikrofon Servis Türü İzni -->
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
+     <!-- Bluetooth İzinleri (Android 12+ / API 31+) -->
+     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+     <!-- Eski Android Sürümleri İçin Fallback -->
+     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+
+     <application
+         android:allowBackup="true"
+         android:icon="@mipmap/ic_launcher"
+         android:label="Kask Intercom Filtresi"
+         android:theme="@style/Theme.MaterialComponents.DayNight.DarkActionBar">
+
+         <activity
+             android:name=".MainActivity"
+             android:exported="true">
+             <intent-filter>
+                 <action android:name="android.intent.action.MAIN" />
+                 <category android:name="android.intent.category.LAUNCHER" />
+             </intent-filter>
+         </activity>
+
+         <!-- Android 14+ Zorunlu foregroundServiceType="microphone" -->
+         <service
+             android:name=".IntercomFilterService"
+             android:enabled="true"
+             android:exported="false"
+             android:foregroundServiceType="microphone" />
+
+     </application>
+ </manifest>
+*/
+
+/*
+ =========================================================================================
+ BÖLÜM 2: Gerçek Zamanlı DSP Rüzgar & Egzoz Filtresi (WindNoiseFilter.kt)
+ =========================================================================================
+ * 1. 2. Derece Butterworth High-Pass IIR Filtresi:
+ *    Motosiklet hızlandıkça kask içinde oluşan 150-180 Hz altındaki mekanik titreşim,
+ *    egzoz patlaması ve türbülans uğultularını bastırır.
+ * 2. Dynamic Noise Gate (Gürültü Kapısı):
+ *    Sürücü konuşmadığında arka plan rüzgar tıslaması ve yol gürültüsünü susturur.
+ *    Karakteristik 'pıtraklı' kesilmeleri önlemek için yumuşak Attack / Release zarfı (envelope) kullanır.
+ */
+class WindNoiseFilter(
+    private val sampleRate: Int = 16000,
+    private val cutoffFrequency: Float = 160.0f, // 160 Hz altı kesilir
+    private val gateThreshold: Float = 600.0f    // Konuşma algılama eşiği (16-bit PCM genliği 0..32767)
+) {
+    // 2. Derece IIR High-Pass Filtre Katsayıları
+    private var a0: Float = 1f
+    private var a1: Float = 0f
+    private var a2: Float = 0f
+    private var b1: Float = 0f
+    private var b2: Float = 0f
+
+    // Gecikme Belleği (State variables)
+    private var x1: Float = 0f
+    private var x2: Float = 0f
+    private var y1: Float = 0f
+    private var y2: Float = 0f
+
+    // Noise Gate Zarf Takipçisi (Envelope Follower)
+    private var envelope: Float = 0f
+    private val attackAlpha: Float = 0.25f   // Kapının hızlı açılması (harf başlangıçları yutulmaz)
+    private val releaseAlpha: Float = 0.03f  // Kapının yumuşak kapanması (kelime sonları çatlamaz)
+
+    init {
+        calculateBiquadCoefficients()
+    }
+
+    private fun calculateBiquadCoefficients() {
+        val omega = (2.0 * PI * cutoffFrequency / sampleRate).toFloat()
+        val cosOmega = kotlin.math.cos(omega)
+        val sinOmega = kotlin.math.sin(omega)
+        val q = 0.7071f // Butterworth düzlemsel geçiş bandı faktörü
+        val alpha = sinOmega / (2.0f * q)
+
+        val b0 = (1.0f + cosOmega) / 2.0f
+        val b1Temp = -(1.0f + cosOmega)
+        val b2Temp = (1.0f + cosOmega) / 2.0f
+        val a0Temp = 1.0f + alpha
+        val a1Temp = -2.0f * cosOmega
+        val a2Temp = 1.0f - alpha
+
+        // Normalize
+        a0 = b0 / a0Temp
+        a1 = b1Temp / a0Temp
+        a2 = b2Temp / a0Temp
+        b1 = a1Temp / a0Temp
+        b2 = a2Temp / a0Temp
+    }
+
+    /**
+     * Ham Short PCM dizisini rüzgar filtresi ve noise gate'ten geçirir.
+     */
+    fun process(buffer: ShortArray, length: Int) {
+        for (i in 0 until length) {
+            val inputSample = buffer[i].toFloat()
+
+            // 1. ADIM: IIR High-Pass Filtresi (Rüzgar & Egzoz Gürültüsü Bastırma)
+            val hpSample = a0 * inputSample + a1 * x1 + a2 * x2 - b1 * y1 - b2 * y2
+            x2 = x1
+            x1 = inputSample
+            y2 = y1
+            y1 = hpSample
+
+            // 2. ADIM: Zarf Analizi (Envelope Tracking)
+            val absVal = abs(hpSample)
+            envelope = if (absVal > envelope) {
+                envelope * (1.0f - attackAlpha) + absVal * attackAlpha
+            } else {
+                envelope * (1.0f - releaseAlpha) + absVal * releaseAlpha
+            }
+
+            // 3. ADIM: Dynamic Noise Gate Kararı & Yumuşak Kazanç (Gain) Uygulaması
+            val gain = if (envelope > gateThreshold) {
+                1.0f
+            } else {
+                (envelope / gateThreshold) * 0.15f // Tam susturmak yerine doğal zemin fısıltısı bırak
+            }
+
+            var outputSample = hpSample * gain
+
+            // 4. ADIM: Clipping/Doygunluk Koruması (-32768..32767)
+            if (outputSample > Short.MAX_VALUE) outputSample = Short.MAX_VALUE.toFloat()
+            if (outputSample < Short.MIN_VALUE) outputSample = Short.MIN_VALUE.toFloat()
+
+            buffer[i] = outputSample.toInt().toShort()
+        }
+    }
+}
+
+/*
+ =========================================================================================
+ BÖLÜM 3: Bluetooth SCO & Ses Yöneticisi (BluetoothAudioController.kt)
+ =========================================================================================
+ * Bluetooth Hands-Free (HFP) profilini tetikleyerek intercom mikrofonunu sisteme bağlar.
+ */
+class BluetoothAudioController(
+    private val context: Context,
+    private val onScoStateChanged: (Boolean) -> Unit
+) {
+    private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    private var isReceiverRegistered = false
+
+    private val scoReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context?, intent: Intent?) {
+            val action = intent?.action
+            if (AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED == action) {
+                val state = intent.getIntExtra(
+                    AudioManager.EXTRA_SCO_AUDIO_STATE,
+                    AudioManager.SCO_AUDIO_STATE_ERROR
+                )
+                when (state) {
+                    AudioManager.SCO_AUDIO_STATE_CONNECTED -> {
+                        Log.i("BluetoothSCO", "Kask Mikrofonu (SCO) Başarıyla Bağlandı!")
+                        audioManager.isBluetoothScoOn = true
+                        onScoStateChanged(true)
+                    }
+                    AudioManager.SCO_AUDIO_STATE_DISCONNECTED -> {
+                        Log.w("BluetoothSCO", "SCO Bağlantısı Kesildi.")
+                        audioManager.isBluetoothScoOn = false
+                        onScoStateChanged(false)
+                    }
+                    AudioManager.SCO_AUDIO_STATE_CONNECTING -> {
+                        Log.d("BluetoothSCO", "SCO Bağlantısı Kuruluyor...")
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Kask mikrofonunu aktifleştirmek için Bluetooth SCO başlatır.
+     */
+    fun startBluetoothSco() {
+        if (!isReceiverRegistered) {
+            val filter = IntentFilter(AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED)
+            context.registerReceiver(scoReceiver, filter)
+            isReceiverRegistered = true
+        }
+
+        try {
+            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+            audioManager.startBluetoothSco()
+            audioManager.isBluetoothScoOn = true
+            Log.d("BluetoothSCO", "Bluetooth SCO isteği gönderildi.")
+        } catch (e: Exception) {
+            Log.e("BluetoothSCO", "SCO başlatma hatası: ${e.message}")
+        }
+    }
+
+    /**
+     * SCO kanalını kapatır ve ses modunu normale döndürür.
+     */
+    fun stopBluetoothSco() {
+        try {
+            audioManager.isBluetoothScoOn = false
+            audioManager.stopBluetoothSco()
+            audioManager.mode = AudioManager.MODE_NORMAL
+            if (isReceiverRegistered) {
+                context.unregisterReceiver(scoReceiver)
+                isReceiverRegistered = false
+            }
+            onScoStateChanged(false)
+            Log.d("BluetoothSCO", "Bluetooth SCO başarıyla durduruldu.")
+        } catch (e: Exception) {
+            Log.e("BluetoothSCO", "SCO durdurma hatası: ${e.message}")
+        }
+    }
+}
+
+/*
+ =========================================================================================
+ BÖLÜM 4: Kesintisiz Arka Plan Servisi (IntercomFilterService.kt)
+ =========================================================================================
+ * - Foreground Service (microphone tipi).
+ * - CPU Uykusunu önleyen WakeLock.
+ * - Gerçek Zamanlı AudioRecord -> DSP -> AudioTrack (Monitor/Loopback) döngüsü.
+ */
+class IntercomFilterService : Service() {
+
+    private companion object {
+        const val NOTIFICATION_ID = 1001
+        const val CHANNEL_ID = "intercom_noise_filter_channel"
+        const val SAMPLE_RATE = 16000 // Standart Bluetooth SCO bant genişliği (G.722 / mSBC)
+    }
+
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var scoController: BluetoothAudioController? = null
+    private val filter = WindNoiseFilter(sampleRate = SAMPLE_RATE, cutoffFrequency = 160f, gateThreshold = 650f)
+
+    private val serviceJob = SupervisorJob()
+    private val serviceScope = CoroutineScope(Dispatchers.Default + serviceJob)
+
+    private var audioRecord: AudioRecord? = null
+    private var audioTrack: AudioTrack? = null
+    @Volatile
+    private var isProcessing = false
+
+    override fun onCreate() {
+        super.onCreate()
+        acquireWakeLock()
+        createNotificationChannel()
+
+        scoController = BluetoothAudioController(this) { isConnected ->
+            Log.d("IntercomService", "SCO Durumu Değişti: $isConnected")
+        }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val notification = createNotification("Kask Gürültü Filtresi Aktif ve Arka Planda Dinliyor")
+
+        // Android 14+ için mikrofon türü zorunludur
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+
+        // Bluetooth mikrofon kanalını aç
+        scoController?.startBluetoothSco()
+
+        // Ses işleme coroutine'ini başlat
+        startAudioProcessingLoop()
+
+        return START_STICKY // Servis işletim sistemi tarafından sonlandırılırsa yeniden başlat
+    }
+
+    private fun acquireWakeLock() {
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = powerManager.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK,
+            "IntercomFilter::WakeLockTag"
+        ).apply {
+            setReferenceCounted(false)
+            acquire(24 * 60 * 60 * 1000L) // Güvenlik amacıyla maksimum 24 saat
+        }
+    }
+
+    private fun startAudioProcessingLoop() {
+        if (isProcessing) return
+        isProcessing = true
+
+        serviceScope.launch(Dispatchers.IO) {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+
+            val bufferSize = AudioRecord.getMinBufferSize(
+                SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+            )
+
+            // Buffer gecikmesini düşük tutmak için optimize edilmiş tampon boyutu
+            val frameSize = bufferSize.coerceAtLeast(1024)
+            val audioBuffer = ShortArray(frameSize)
+
+            try {
+                if (ActivityCompat.checkSelfPermission(
+                        this@IntercomFilterService,
+                        Manifest.permission.RECORD_AUDIO
+                    ) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    Log.e("IntercomService", "Ses kaydı izni yok!")
+                    return@launch
+                }
+
+                // Bluetooth mikrofon girişi için VOICE_COMMUNICATION kaynağı kullanılır (AEC ve NS donanım desteği için)
+                audioRecord = AudioRecord(
+                    MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                    SAMPLE_RATE,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    frameSize * 2
+                )
+
+                // Filtrelenmiş sesi doğrudan kask hoparlörüne veya çıkış akışına yönlendiren AudioTrack
+                audioTrack = AudioTrack.Builder()
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setSampleRate(SAMPLE_RATE)
+                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                            .build()
+                    )
+                    .setBufferSizeInBytes(frameSize * 2)
+                    .setTransferMode(AudioTrack.MODE_STREAM)
+                    .build()
+
+                audioRecord?.startRecording()
+                audioTrack?.play()
+                Log.i("IntercomService", "Ses İşleme Motoru Başlatıldı. 16kHz 16-Bit Mono.")
+
+                while (isProcessing && isActive) {
+                    val readSamples = audioRecord?.read(audioBuffer, 0, frameSize) ?: 0
+                    if (readSamples > 0) {
+                        // 1. Gerçek Zamanlı DSP Rüzgar ve Egzoz Filtresi
+                        filter.process(audioBuffer, readSamples)
+
+                        // 2. Filtrelenmiş temiz akışı çıkışa bas (AudioTrack veya Ağ soketi)
+                        audioTrack?.write(audioBuffer, 0, readSamples)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("IntercomService", "Kritik DSP Döngü Hatası: ${e.message}")
+            } finally {
+                releaseAudioHardware()
+            }
+        }
+    }
+
+    private fun releaseAudioHardware() {
+        try {
+            audioRecord?.apply {
+                if (state == AudioRecord.STATE_INITIALIZED) stop()
+                release()
+            }
+            audioTrack?.apply {
+                if (state == AudioTrack.STATE_INITIALIZED) stop()
+                release()
+            }
+            audioRecord = null
+            audioTrack = null
+        } catch (e: Exception) {
+            Log.e("IntercomService", "Donanım bırakma hatası: ${e.message}")
+        }
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "Intercom Rüzgar Filtresi Arka Plan Servisi",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Motosiklet kask mikrofonu rüzgar gürültüsünü filtreler."
+                setShowBadge(false)
+            }
+            val manager = getSystemService(NotificationManager::class.java)
+            manager?.createNotificationChannel(channel)
+        }
+    }
+
+    private fun createNotification(content: String): Notification {
+        val launchIntent = Intent(this, MainActivity::class.java)
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            0,
+            launchIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Motosiklet Intercom Filtresi")
+            .setContentText(content)
+            .setSmallIcon(android.R.drawable.stat_notify_chat)
+            .setOngoing(true) // Kullanıcı tarafından kapatılamaz
+            .setContentIntent(pendingIntent)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .build()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        isProcessing = false
+        serviceJob.cancel()
+        scoController?.stopBluetoothSco()
+        releaseAudioHardware()
+
+        wakeLock?.let {
+            if (it.isHeld) it.release()
+        }
+        Log.i("IntercomService", "Servis başarıyla kapatıldı.")
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+}
+
+/*
+ =========================================================================================
+ BÖLÜM 5: Kullanıcı Arayüzü (MainActivity.kt)
+ =========================================================================================
+ * - Runtime izinleri (BLUETOOTH_CONNECT, RECORD_AUDIO vb.) yönetir.
+ * - Servisi başlatıp durduran butonları ve durum metnini barındırır.
+ */
+class MainActivity : AppCompatActivity() {
+
+    private lateinit var tvStatus: TextView
+    private lateinit var btnStart: Button
+    private lateinit var btnStop: Button
+
+    // Gerekli çalışma zamanı izinleri
+    private val requiredPermissions = buildList {
+        add(Manifest.permission.RECORD_AUDIO)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            add(Manifest.permission.BLUETOOTH_CONNECT)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }.toTypedArray()
+
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val allGranted = permissions.entries.all { it.value }
+        if (allGranted) {
+            tvStatus.text = "İzinler onaylandı. Kaskı bağlayıp başlatabilirsiniz."
+            btnStart.isEnabled = true
+        } else {
+            tvStatus.text = "Hata: Mikrofon ve Bluetooth izinleri zorunludur!"
+            btnStart.isEnabled = false
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        // Basit ve modern programatik arayüz
+        val rootLayout = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(60, 100, 60, 60)
+            gravity = android.view.Gravity.CENTER_HORIZONTAL
+        }
+
+        tvStatus = TextView(this).apply {
+            text = "Kask Durumu Kontrol Ediliyor..."
+            textSize = 16f
+            setPadding(0, 0, 0, 80)
+            textAlignment = TextView.TEXT_ALIGNMENT_CENTER
+        }
+
+        btnStart = Button(this).apply {
+            text = "Filtreyi Başlat (SCO Aktif Et)"
+            setOnClickListener { startIntercomService() }
+        }
+
+        btnStop = Button(this).apply {
+            text = "Filtreyi Durdur"
+            isEnabled = false
+            setOnClickListener { stopIntercomService() }
+        }
+
+        rootLayout.addView(tvStatus)
+        rootLayout.addView(btnStart)
+        rootLayout.addView(btnStop)
+        setContentView(rootLayout)
+
+        checkAndRequestPermissions()
+    }
+
+    private fun checkAndRequestPermissions() {
+        val missingPermissions = requiredPermissions.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+
+        if (missingPermissions.isEmpty()) {
+            tvStatus.text = "Hazır: Kask intercomu bağlıysa başlatın."
+            btnStart.isEnabled = true
+        } else {
+            permissionLauncher.launch(missingPermissions.toTypedArray())
+        }
+    }
+
+    private fun startIntercomService() {
+        val serviceIntent = Intent(this, IntercomFilterService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(serviceIntent)
+        } else {
+            startService(serviceIntent)
+        }
+
+        tvStatus.text = "Durum: Filtreleme devrede! Ekranı kilitleseniz dahi çalışır."
+        btnStart.isEnabled = false
+        btnStop.isEnabled = true
+    }
+
+    private fun stopIntercomService() {
+        val serviceIntent = Intent(this, IntercomFilterService::class.java)
+        stopService(serviceIntent)
+
+        tvStatus.text = "Durum: Filtreleme durduruldu."
+        btnStart.isEnabled = true
+        btnStop.isEnabled = false
+    }
+}
